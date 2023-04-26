@@ -1,5 +1,8 @@
 # Generation results
 results/
+test/
+test*/
+resample*/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

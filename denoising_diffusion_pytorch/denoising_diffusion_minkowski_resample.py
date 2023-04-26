@@ -5,6 +5,8 @@ import MinkowskiEngine as ME
 import numpy as np
 import tqdm
 import glob, json, os
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
 
 def set_feature(x, features):
     assert(x.F.shape[0] == features.shape[0])
@@ -326,8 +328,6 @@ class MinkUNet(nn.Module):
         self.levels = len(self.PLANES) // 2
         if attns is not None:
             self.ATTNS = attns.split()
-            print(self.ATTNS)
-            input()
         self.init_network(in_channels, out_channels, time_channels)
         self.init_weight()
 
@@ -513,7 +513,7 @@ class GaussianDiffusion(nn.Module):
         objective="pred_noise",
         beta_schedule="sigmoid",
         schedule_fn_kwargs=dict(),
-        p2_loss_weight_gamma=0.5, # p2 loss weight, 0 is equivalent to weight of 1 across time - 1. is recommended
+        p2_loss_weight_gamma=0.0, # p2 loss weight, 0 is equivalent to weight of 1 across time - 1. is recommended
         p2_loss_weight_k=1,
         ddim_sampling_eta=0.,
     ):
@@ -731,7 +731,7 @@ class GaussianDiffusion(nn.Module):
         else:
             raise ValueError(f"invalid loss type {self.loss_type}")
 
-    def p_losses(self, x_start, t):
+    def p_losses(self, x_start, t, spatial_weight=None):
         # noise sample
         noise = set_feature(x_start, torch.randn_like(x_start.F))
         x = self.q_sample(x_start=x_start, t=t, noise=noise)
@@ -757,19 +757,138 @@ class GaussianDiffusion(nn.Module):
         else:
             raise ValueError(f'unknown objective {self.objective}')
 
-        loss = self.loss_fn(model_out.F, target.F, reduction="none").mean(dim=1)
+        loss = self.loss_fn(model_out.F, target.F, reduction="none")
+        if spatial_weight is None:
+            loss = loss.mean(dim=1)
+        else:
+            spatial_weight /= spatial_weight.mean()
+            loss = (loss * spatial_weight).mean(dim=1)
         loss *= self.p2_loss_weight[t.long()][model_out.C[:, 0].long()]
         return loss.mean()
 
-    def forward(self, x, fix_t=None):
+    def forward(self, x, fix_t=None, spatial_weight=None):
         batch_size = x.C[:, 0].int().max() + 1
         t = torch.randint(0, self.num_timesteps, (batch_size,), device=x.F.device).long()
         if fix_t:
             t *= 0
             t += fix_t
-        return self.p_losses(x, t)
+        return self.p_losses(x, t, spatial_weight)
 
 
+
+
+class HoliCityPointCloudDataset(Dataset):
+    def __init__(self, rootdir):
+        self.pc_files = sorted(glob.glob(f"{rootdir}/*.npz"))
+
+    def __len__(self):
+        return len(self.pc_files)
+
+    def __getitem__(self, idx):
+        pc = np.load(self.pc_files[idx])
+        coord = pc["coord"]
+        color = pc["color"]
+        dist = pc["dist"]
+        return coord, color, dist
+
+
+def xyz2lonlatdist(coord):
+    # coord: N, 3
+    dist = torch.norm(coord, dim=-1, keepdim=True)
+    normed_coord = coord / dist
+    lat = torch.arcsin(normed_coord[:, 2]) # -pi/2 to pi/2
+    lon = torch.arctan2(normed_coord[:, 0], normed_coord[:, 1]) # -pi to pi
+    return lon, lat, dist[:, 0]
+
+def xyz2coord(coord):
+    # coord: N, 3
+    lon, lat, dist = xyz2lonlatdist(coord)
+    y = lat / (torch.pi / 2.0)
+    x = lon / torch.pi
+    dist /= dist.max()
+    return torch.stack([-x * 2, y, dist], dim=-1)
+
+import pytorch3d
+from pytorch3d.structures import Pointclouds
+from pytorch3d.renderer import compositing
+from pytorch3d.renderer.points import rasterize_points
+
+class RasterizePointsXYsBlending(nn.Module):
+    """
+    Rasterizes a set of points using a differentiable renderer. Points are
+    accumulated in a z-buffer using an accumulation function
+    defined in opts.accumulation and are normalised with a value M=opts.M.
+    Inputs:
+    - pts3D: the 3D points to be projected
+    - src: the corresponding features
+    - C: size of feature
+    - learn_feature: whether to learn the default feature filled in when
+                     none project
+    - radius: where pixels project to (in pixels)
+    - size: size of the image being created
+    - points_per_pixel: number of values stored in z-buffer per pixel
+    - opts: additional options
+    Outputs:
+    - transformed_src_alphas: features projected and accumulated
+        in the new view
+    """
+
+    def __init__(
+        self,
+        radius=3.0,
+        size=(256, 512),
+        points_per_pixel=8,
+        rad_pow=2,
+        tau=1.0,
+        accumulation="alphacomposite",
+    ):
+        super().__init__()
+        self.radius = radius
+        self.size = size
+        self.points_per_pixel = points_per_pixel
+        self.rad_pow = rad_pow
+        self.tau = tau
+        self.accumulation = accumulation
+
+    def forward(self, mink_field):
+        # mink_field: batch size 1
+        pts3D = pytorch3d.structures.Pointclouds(
+            points=xyz2coord(mink_field.C[:, 1:])[None, ...],
+            features=mink_field.F[None, ...]
+        )
+
+        radius = float(self.radius) / float(self.size[0]) * 2.0
+
+        points_idx, _, dist = rasterize_points(
+            pts3D, self.size, radius, self.points_per_pixel
+        )
+        # dist = dist / pow(radius, self.rad_pow)
+        alphas = (
+            (1 - dist.clamp(max=1, min=1e-3).pow(0.5))
+            .pow(self.tau)
+            .permute(0, 3, 1, 2)
+        )
+
+        if self.accumulation == 'alphacomposite':
+            transformed_src_alphas = compositing.alpha_composite(
+                points_idx.permute(0, 3, 1, 2).long(),
+                alphas,
+                pts3D.features_packed().permute(1,0),
+            )
+        elif self.accumulation == 'wsum':
+            transformed_src_alphas = compositing.weighted_sum(
+                points_idx.permute(0, 3, 1, 2).long(),
+                alphas,
+                pts3D.features_packed().permute(1,0),
+            )
+        elif self.accumulation == 'wsumnorm':
+            transformed_src_alphas = compositing.weighted_sum_norm(
+                points_idx.permute(0, 3, 1, 2).long(),
+                alphas,
+                pts3D.features_packed().permute(1,0),
+            )
+
+        return transformed_src_alphas
 
 
 
@@ -778,150 +897,77 @@ if __name__ == "__main__":
     import argparse
     import sys
 
-    sys.path.append("/cluster/project/cvg/zuoyue/torch-ngp")
-    from main_nerf import get_args
-
-    opt = get_args()
-
-    if opt.O:
-        opt.fp16 = True
-        opt.cuda_ray = True
-        opt.preload = True
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset_folder', type=str)
+    parser.add_argument('--dataset_mode', type=str, default='train')
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--num_epoch', type=float, default=300)
+    parser.add_argument('--net_attention', type=str, default=None)
+    parser.add_argument('--work_folder', type=str)
+    parser.add_argument('--ckpt', type=str, default=None)
+    parser.add_argument('--sampling_steps', type=int, default=1000)
+    parser.add_argument('--random_x_flip', action='store_true')
+    parser.add_argument('--random_y_flip', action='store_true')
+    parser.add_argument('--random_z_rotate', action='store_true')
+    parser.add_argument('--random_gamma_correction', action='store_true')
+    parser.add_argument('--save_gt', action='store_true')
+    parser.add_argument('--use_ema', action='store_true')
     
-    if opt.patch_size > 1:
-        opt.error_map = False # do not use error_map if use patch-based training
-        # assert opt.patch_size > 16, "patch_size should > 16 to run LPIPS loss."
-        assert opt.num_rays % (opt.patch_size ** 2) == 0, "patch_size ** 2 should be dividable by num_rays."
+    opt = parser.parse_args()
 
-
-    if opt.ff:
-        opt.fp16 = True
-        assert opt.bg_radius <= 0, "background model is not implemented for --ff"
-    elif opt.tcnn:
-        opt.fp16 = True
-        assert opt.bg_radius <= 0, "background model is not implemented for --tcnn"
-    else:
-        pass
-    
-    from nerf.provider import NeRFDataset
+    holicity_pc_dataset = HoliCityPointCloudDataset(opt.dataset_folder)
+    is_train = opt.dataset_mode == "train"
+    train_loader = DataLoader(holicity_pc_dataset, batch_size=1, shuffle=is_train)
 
     scale = 10
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     func = lambda x: torch.cat([x, x[:1]], dim=0)
-    train_loader = NeRFDataset(opt, device=device, type="train").dataloader_my(batch_size=8)
 
-    # vals = [[], [], []]
-    # for data_idx, data in enumerate(train_loader):
-    #     pts = data['pts_coords'][data['pts_masks']].cpu()
-    #     for i in range(3):
-    #         val, bins = torch.histogram(pts[:, i], bins=400, range=(-200, 200))
-    #         vals[i].append(val)
-    #     print(data_idx)
-    # import matplotlib; matplotlib.use("agg")
-    # import matplotlib.pyplot as plt
-    # rs = [(-64, 64), (-64, 64), (-5, 27)]
-    # for i in range(3):
-    #     s = torch.stack(vals[i]).sum(dim=0).numpy()
-    #     plt.plot(bins.numpy()[:-1], s, "-")
-    #     plt.savefig(f"{i}.png")
-    #     plt.clf()
-    #     a, b = rs[i]
-    #     print(s[a+200: b+200].sum() / s.sum())
-    
-    # quit()
+    net = MinkUNet(3, 3, time_channels=32, attns=opt.net_attention).to(device)
+    diffusion_model = GaussianDiffusion(net, sampling_timesteps=opt.sampling_steps).to(device)
 
-    # for data in train_loader:
-    #     pts = data['pts_coords'][data['pts_masks']].to(device)
-    #     pts_batch = data['pts_batch'][data['pts_masks']].unsqueeze(-1).to(device)
-    #     feats = func(data['pts_rgbs'][data['pts_masks']]).to(device)
-    #     coords = func(torch.cat([pts_batch, pts * scale], dim=-1))
-    #     pts_field = ME.TensorField(
-    #         features=feats * 2 - 1, # in a range of -1 to 1
-    #         coordinates=coords,
-    #         quantization_mode=ME.SparseTensorQuantizationMode.UNWEIGHTED_AVERAGE,
-    #         minkowski_algorithm=ME.MinkowskiAlgorithm.SPEED_OPTIMIZED,
-    #         device=pts.device,
-    #     )
-    #     pts_sparse = pts_field.sparse()
-    #     torch.save({
-    #         "features": pts_sparse.F,
-    #         "coordinates": pts_sparse.C,
-    #     }, f"test_point_cloud_scale_20.pt")
-    # quit()
+    if opt.use_ema:
+        from ema_pytorch import EMA
+        ema_net = MinkUNet(3, 3, time_channels=32, attns=opt.net_attention).to(device)
+        ema_diffusion_model = GaussianDiffusion(ema_net, sampling_timesteps=opt.sampling_steps).to(device)
+        ema_model = EMA(
+            model=diffusion_model,
+            ema_model=ema_diffusion_model,
+            beta=0.9999,              # exponential moving average factor
+            update_after_step=2000,      # only after this number of .update() calls will it start updating
+            update_every=20,          # how often to actually update, to save on compute (updates every 10th .update() call)
+        )
 
-    # count = 0
-    # for data in train_loader:
-    #     with open(f'test_newsurface/datavis/{count:04d}.txt', 'w') as f:
-    #         for (x, y, z), (r, g, b) in zip(
-    #             data['pts_coords'][data['pts_masks']].cpu().numpy(),
-    #             (255 * data['pts_rgbs'][data['pts_masks']].cpu().numpy()).astype(np.uint8),
-    #         ):
-    #             f.write('%.3lf %.3lf %.3lf %d %d %d\n' % (x, y, z, r, g, b))
-    #         count += 1
-    #         # if count % 8 == 0:
-    #         input('check')
+    optimizer = torch.optim.Adam(diffusion_model.parameters(), lr=opt.lr, betas=(0.9, 0.99))
+    scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.2, total_iters=opt.num_epoch)
 
-    net = MinkUNet(3, 3, time_channels=32, attns=opt.diff_arg_net_attention).to(device)
-    diffusion_model = GaussianDiffusion(net, sampling_timesteps=opt.diff_arg_sampling_steps).to(device)
+    folder = opt.work_folder
+    start_epoch = 0
+    if is_train and opt.ckpt is not None:
+        model_dict = torch.load(f"{folder}/{opt.ckpt}")
+        diffusion_model.load_state_dict(model_dict["model"])
+        if opt.use_ema:
+            ema_model.load_state_dict(model_dict["ema_model"])
+        # start_epoch = model_dict["epoch"]
+    import os
+    os.system(f"mkdir -p {folder}/datavis")
 
-    optimizer = torch.optim.Adam(diffusion_model.parameters(), lr=1e-3, betas=(0.9, 0.99))
+    logger_file = f"log_{opt.dataset_mode}.txt"
+    num_epochs = opt.num_epoch if is_train else 1
 
-    # folder = "test190furtherperturb"
-    # folder = "test1520newsurface"
-    # folder = "test1520constdepth"
-    # folder = "test190dataaug"
-    # folder = "test1520dataaugattn2"
-    folder = opt.diff_arg_folder
-    if opt.diff_arg_ckpt is not None:
-        diffusion_model.load_state_dict(torch.load(f"{folder}/{opt.diff_arg_ckpt}"))
-        import os
-        os.system(f"mkdir {folder}/datavis")
-
-    # pcfiles = sorted(glob.glob("/home/lzq/lzy/torch-ngp/data/holicity_single_view/point_clouds/*.txt"))#[:640]
-    # pcfiles = pcfiles[632:648] + pcfiles[1528:1536]
-
-    # from make_ngp_singleview_dataset import HoliCityDataset
-    # dataset = HoliCityDataset('/home/lzq/lzy/HoliCity', 'train', since_month='2018-01')
-
-    # pcfiles = sorted(
-    #     [f"/home/lzq/lzy/torch-ngp/data/holicity_single_view/point_clouds/{file.split('/')[-1]}.txt" for file in dataset.filelist[:680]]
-    # )[:24]
-
-    # import os
-    # with open("/home/lzq/lzy/torch-ngp/data/holicity_single_view/transforms.json", 'r') as f:
-    #     names = [f['file_path'].split("/")[-1].replace(".jpg", "") for f in json.load(f)["frames"]]
-    # pcfiles = [f"/home/lzq/lzy/torch-ngp/data/holicity_single_view/point_clouds/{name}.txt" for name in names][:1520]
-    # pcfiles = pcfiles[:1520]
-    # pcfiles.sort(key=lambda x: os.path.getmtime(x))
-    # import os
-    # for pcfile in pcfiles:
-    #     if not os.path.exists(pcfile):
-    #         # print(os.path.getmtime(pcfile), pcfile)
-    #         print(pcfile)
-    # quit()
-
-    logger_file = "log.txt" if opt.diff_arg_dataset == "train" else "log_no.txt"
-    num_epochs = 99999 if opt.diff_arg_dataset == "train" else 1
-
-    with open(f"{folder}/{logger_file}", "w") as f:
+    with open(f"{folder}/{logger_file}", "a") as f:
         for epoch in range(0, num_epochs):
+
+            if is_train and epoch < start_epoch:
+                scheduler.step()
+                continue
+
             data_idx = 0
-            # diffusion_model.load_state_dict(torch.load(f"{folder}/epoch{epoch}.pt"))
-            for data in train_loader:
-            # for pcfile in pcfiles:
+            for pts, feats, dists in train_loader:
 
-                # if not os.path.exists(pcfile):
-                #     continue
-
-                optimizer.zero_grad(set_to_none=True)
-
-                pts = data['pts_coords'][data['pts_masks']].to(device)
-                pts_batch = data['pts_batch'][data['pts_masks']].unsqueeze(-1).to(device) * 0
-                feats = data['pts_rgbs'][data['pts_masks']].to(device)
-                # data = np.loadtxt(pcfile)
-                # pts = torch.from_numpy(data[:,:3]).to(device)
-                # pts_batch = pts[:,0:1] * 0
-                # feats = torch.from_numpy(data[:,3:]).float().to(device) / 255.0
+                pts = pts.to(device)[0].float()
+                feats = feats.to(device)[0].float() / 255.0
+                dists = dists.to(device)[0].float()
 
                 if opt.random_x_flip and np.random.rand() < 0.5:
                     pts[:, 0] *= -1
@@ -941,72 +987,105 @@ if __name__ == "__main__":
                 if opt.random_gamma_correction:
                     assert(feats.min() >= 0)
                     assert(feats.max() <= 1)
-                    max_gamma = 1.6
+                    max_gamma = 1.25
                     gamma = np.random.rand() * (max_gamma - 1) + 1
                     if np.random.rand() < 0.5:
                         gamma = 1.0 / gamma
                     feats = feats ** gamma
 
-                if False: # crop point cloud, only closer points are kept
-                    close_pts_mask = torch.sqrt((pts ** 2).sum(dim=1)) < 50
-                    pts = pts[close_pts_mask]
-                    pts_batch = pts_batch[close_pts_mask]
-                    feats = feats[close_pts_mask]
-                
-                if False: # randomly disturb the location
-                    pts = pts + torch.rand_like(pts) / scale
-
-                coords = func(torch.cat([pts_batch, pts * scale], dim=-1))
+                coords = func(torch.cat([pts[:, :1] * 0, pts * scale], dim=-1))
+                feats = torch.cat([
+                    feats * 2 - 1, # in a range of -1 to 1
+                    dists[..., None],
+                ], dim=-1)
                 feats = func(feats)
+
                 pts_field = ME.TensorField(
-                    features=feats * 2 - 1, # in a range of -1 to 1
+                    features=feats,
                     coordinates=coords,
                     quantization_mode=ME.SparseTensorQuantizationMode.UNWEIGHTED_AVERAGE,
                     minkowski_algorithm=ME.MinkowskiAlgorithm.SPEED_OPTIMIZED,
                     device=pts.device,
                 )
                 pts_sparse = pts_field.sparse()
+                spatial_weight = torch.exp(-pts_sparse.F[:, -1:])
+                pts_sparse = set_feature(pts_sparse, pts_sparse.F[:, :-1])
 
-                if False: # select xxx% of the points
-                    perm = torch.randperm(pts_sparse.F.shape[0])
-                    bound = int(pts_sparse.F.shape[0] * 0.25)
-                    pts_sparse = ME.SparseTensor(
-                        features=pts_sparse.F[perm[:bound]],
-                        coordinates=pts_sparse.C[perm[:bound]],
-                        device=pts.device,
-                    )
-                
-                # for gamma in [1/5, 1/4, 1/3, 1/2, 1, 2, 3, 4, 5]:
-                #     with open(f"{folder}/datavis/data_gamma_{gamma:02f}.txt", "w") as f:
-                #         for (_, x, y, z), (r, g, b) in zip(
-                #             pts_sparse.C.cpu().numpy(),
-                #             ((((pts_sparse.F + 1) / 2) ** gamma) * 255).cpu().numpy().astype(np.uint8),
-                #         ):
-                #             f.write('%.3lf %.3lf %.3lf %d %d %d\n' % (x, y, z, r, g, b))
-                # quit()
-
-                if opt.diff_arg_dataset != "train":
-                    with torch.no_grad():
-                        pred = diffusion_model.sample(pts_sparse)
-                        with open(f"{folder}/datavis/data_{data_idx}.txt", "w") as f:
+                if opt.save_gt:
+                    assert(False)
+                    pts_vis = pts_sparse
+                    pool = ME.MinkowskiAvgPooling(kernel_size=2, stride=2, dimension=3)
+                    for k in range(4):
+                        with open(f"{folder}/datavis/gt_data_{data_idx}_{k}.txt", "w") as f:
                             for (_, x, y, z), (r, g, b) in zip(
-                                pred.C.cpu().numpy(),
-                                (torch.clamp(pred.F, -1, 1) * 127.5 + 127.5).cpu().numpy().astype(np.uint8),
+                                pts_vis.C.cpu().numpy(),
+                                (torch.clamp(pts_vis.F, -1, 1) * 127.5 + 127.5).cpu().numpy().astype(np.uint8),
                             ):
                                 f.write('%.3lf %.3lf %.3lf %d %d %d\n' % (x, y, z, r, g, b))
+                        pts_vis = pool(pts_vis)
+                    # pred_field = pts_sparse.slice(pts_field)
+                    # pred_im = (torch.clamp(pred_field.F[:-1], -1, 1) * 127.5 + 127.5).cpu().numpy().astype(np.uint8)
+                    # Image.fromarray(pred_im.reshape((256, 512, 3))).save(f"{folder}/datavis/data_{data_idx}_gt.png")
+
+                if not is_train:
+                    accum = RasterizePointsXYsBlending()
+                    with torch.no_grad():
+                        # for fix_t in range(100, 1000, 100):
+                        #     loss = diffusion_model(pts_sparse, fix_t=fix_t)
+                        #     print(epoch, fix_t, loss.item())
+                        #     f.write(f"{epoch}\t{fix_t}\t{loss}\n")
+                        #     f.flush()
+                        for ckpt in list(range(*eval(opt.ckpt))):
+                            model_dict = torch.load(f"{folder}/epoch{ckpt}.pt")
+                            diffusion_model.load_state_dict(model_dict["model"])
+                            if opt.use_ema:
+                                ema_model.load_state_dict(model_dict["ema_model"])
+                            
+                            gt_field = pts_sparse.slice(pts_field)
+                            gt_im = accum(gt_field)
+                            gt_im = (torch.clamp(gt_im, -1, 1) * 127.5 + 127.5).cpu().numpy().astype(np.uint8)[0].transpose([1, 2, 0])
+                            Image.fromarray(gt_im).save(f"{folder}/datavis/data_ep{ckpt}_{data_idx}_gt.png")
+                            for sp_time in range(3):
+                                pred = ema_model.ema_model.sample(pts_sparse)
+                                pred_field = pred.slice(pts_field)
+                                pred_im = accum(pred_field)
+                                # with open(f"{folder}/datavis/data_ep{ckpt}_{data_idx}_sp{aaa}.txt", "w") as f:
+                                #     for (_, x, y, z), (r, g, b) in zip(
+                                #         pred.C.cpu().numpy(),
+                                #         (torch.clamp(pred.F, -1, 1) * 127.5 + 127.5).cpu().numpy().astype(np.uint8),
+                                #     ):
+                                #         f.write('%.3lf %.3lf %.3lf %d %d %d\n' % (x, y, z, r, g, b))
+                                # pad_batch = lambda ppp: torch.cat([ppp[:, :1] * 0, ppp], dim=-1)
+                                # pts_org_field = ME.TensorField(
+                                #     features=torch.from_numpy(holicity_pc_dataset.org_color).to(device).float(),
+                                #     coordinates=pad_batch(torch.from_numpy(holicity_pc_dataset.org_coord).to(device).float() * scale),
+                                #     quantization_mode=ME.SparseTensorQuantizationMode.UNWEIGHTED_AVERAGE,
+                                #     minkowski_algorithm=ME.MinkowskiAlgorithm.SPEED_OPTIMIZED,
+                                #     device=device,
+                                #     coordinate_manager=pts_field.coordinate_manager,
+                                # )
+                                # pred_field = pred.features_at_coordinates(pad_batch(torch.from_numpy(holicity_pc_dataset.org_coord).to(device).float() * scale))
+                                pred_im = (torch.clamp(pred_im, -1, 1) * 127.5 + 127.5).cpu().numpy().astype(np.uint8)[0].transpose([1, 2, 0])
+                                Image.fromarray(pred_im).save(f"{folder}/datavis/data_ep{ckpt}_{data_idx}_sp{sp_time}.png")
                     data_idx += 1
                     continue
 
-                # for ttt in [100, 300, 500, 700, 900]:
                 optimizer.zero_grad(set_to_none=True)
-                loss = diffusion_model(pts_sparse)#, fix_t=ttt)
+                loss = diffusion_model(pts_sparse, spatial_weight=spatial_weight)
                 print(epoch, loss.item())
                 f.write(f"{epoch}\t{loss}\n")
                 f.flush()
                 loss.backward()
-
                 optimizer.step()
+                ema_model.update()
+            
+            if is_train:
+                scheduler.step()
 
-            if epoch % 10 == 0:
-                state_dict = diffusion_model.state_dict()
+            if epoch % 5 == 0:
+                state_dict = {
+                    "epoch": epoch,
+                    "model": diffusion_model.state_dict(),
+                    "ema_model": ema_model.state_dict(),
+                }
                 torch.save(state_dict, f"{folder}/epoch{epoch}.pt")

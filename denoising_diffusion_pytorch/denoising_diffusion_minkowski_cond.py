@@ -5,6 +5,8 @@ import MinkowskiEngine as ME
 import numpy as np
 import tqdm
 import glob, json, os
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
 
 def set_feature(x, features):
     assert(x.F.shape[0] == features.shape[0])
@@ -40,7 +42,7 @@ class Identity(nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__()
 
-    def forward(self, x):
+    def forward(self, x, context=None):
         return x
 
 
@@ -236,12 +238,13 @@ class Attention(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, ch, context_ch, num_head=8, ch_head=64, residual=True):
+    def __init__(self, ch, context_ch=4, num_head=8, ch_head=64, residual=True):
         super().__init__()
 
         self.scale = ch_head ** -0.5
         self.num_head = num_head
         self.ch_head = ch_head
+        self.residual = residual
 
         self.to_q = ME.MinkowskiConvolution(
             ch, num_head * ch_head,
@@ -259,7 +262,7 @@ class CrossAttention(nn.Module):
     def forward(self, x, context):
         # x: minkowski tensor
         # context: (B, H*W, ch)
-        h = self.heads
+
         list_permutations = x.decomposition_permutations
         batch_range = list(range(len(list_permutations)))
 
@@ -305,6 +308,7 @@ class SinusoidalPositionEmbeddings(nn.Module):
 ATTN_LAYER = {
     "L": LinearAttention,
     "A": Attention,
+    "C": CrossAttention,
     "N": Identity,
 }
 
@@ -316,7 +320,7 @@ class MinkUNet(nn.Module):
     # ATTNS = "L L L L L L L L L L".split()
     # ATTNS = "L L L L N N L L L L".split()
     # ATTNS = "N N N N A A N N N N".split()
-    ATTNS = "N N N N N N N N N N".split()
+    ATTNS = "N N N C C C C N N N".split()
     # "L", "A", "N" for linear/general/no attention
 
     def __init__(self, in_channels, out_channels, time_channels=None, attns=None):
@@ -326,8 +330,6 @@ class MinkUNet(nn.Module):
         self.levels = len(self.PLANES) // 2
         if attns is not None:
             self.ATTNS = attns.split()
-            print(self.ATTNS)
-            input()
         self.init_network(in_channels, out_channels, time_channels)
         self.init_weight()
 
@@ -396,7 +398,7 @@ class MinkUNet(nn.Module):
             if isinstance(m, ME.MinkowskiConvolution):
                 ME.utils.kaiming_normal_(m.kernel, mode="fan_out", nonlinearity="relu")
 
-    def forward(self, x, times=None):
+    def forward(self, x, context, times=None):
         time_emb = None
         if self.time_mlp is not None and times is not None:
             time_emb = self.time_mlp(times)
@@ -406,7 +408,7 @@ class MinkUNet(nn.Module):
         for blocks, down in zip(self.enc_blocks, self.downs):
             for block, attn in blocks:
                 x = block(x, time_emb=time_emb)
-                x = attn(x)
+                x = attn(x, context)
                 stack.append(x)
             x = down(x)
         
@@ -418,7 +420,7 @@ class MinkUNet(nn.Module):
             for block, attn in blocks:
                 x = ME.cat(x, stack.pop())
                 x = block(x, time_emb=time_emb)
-                x = attn(x)
+                x = attn(x, context)
             
             x = up(x)
         
@@ -629,8 +631,8 @@ class GaussianDiffusion(nn.Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start) * noise
         )
 
-    def model_predictions(self, x, t, x_self_cond=None, clip_x_start=False):
-        model_output = self.model(x, t)#, x_self_cond)
+    def model_predictions(self, x, context, t, x_self_cond=None, clip_x_start=False):
+        model_output = self.model(x, context, t)#, x_self_cond)
         clip = BatchedMinkowski(lambda y: torch.clamp(y, -1., 1.)) if clip_x_start else Identity()
 
         if self.objective == "pred_noise":
@@ -654,29 +656,29 @@ class GaussianDiffusion(nn.Module):
 
         return pred_noise, x_start
 
-    def p_mean_variance(self, x, t, x_self_cond=None, clip_denoised=True):
-        pred_noise, x_start = self.model_predictions(x, t, x_self_cond, clip_denoised)
+    def p_mean_variance(self, x, context, t, x_self_cond=None, clip_denoised=True):
+        pred_noise, x_start = self.model_predictions(x, context, t, x_self_cond, clip_denoised)
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_start, x_t=x, t=t)
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.no_grad()
-    def p_sample(self, x, t: int, x_self_cond=None):
+    def p_sample(self, x, context, t: int, x_self_cond=None):
         batch_size = x.C[:, 0].int().max() + 1
         batched_times = torch.full((batch_size,), t, device=x.F.device, dtype=torch.long)
         model_mean, _, model_log_variance, x_start = self.p_mean_variance(
-            x=x, t=batched_times, x_self_cond=x_self_cond, clip_denoised=True
+            x=x, context=context, t=batched_times, x_self_cond=x_self_cond, clip_denoised=True
         )
         noise = set_feature(x, torch.randn_like(x.F) if t > 0 else torch.zeros_like(x.F)) # no noise if t == 0
         pred_back = model_mean + set_feature(model_log_variance, (0.5 * model_log_variance.F).exp()) * noise
         return pred_back, x_start
 
     @torch.no_grad()
-    def p_sample_loop(self, x):
+    def p_sample_loop(self, x, context):
         x = set_feature(x, torch.randn_like(x.F))
         x_start = None
         for t in tqdm.tqdm(reversed(range(0, self.num_timesteps)), desc="sampling loop time step", total=self.num_timesteps):
             self_cond = x_start if self.self_condition else None
-            x, x_start = self.p_sample(x, t, self_cond)
+            x, x_start = self.p_sample(x, context, t, self_cond)
             # if t % 50 == 0:
             #     with open(f'testoverfit80/{t}.txt', 'w') as f:
             #         for (_, xx, yy, zz), (r, g, b) in zip(
@@ -687,7 +689,7 @@ class GaussianDiffusion(nn.Module):
         return x
 
     @torch.no_grad()
-    def ddim_sample(self, x): # for faster sampling
+    def ddim_sample(self, x, context): # for faster sampling
         batch_size = x.C[:, 0].int().max() + 1
         times = torch.linspace(-1, self.num_timesteps-1, steps=self.sampling_timesteps+1)
         # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == num_timesteps
@@ -699,7 +701,7 @@ class GaussianDiffusion(nn.Module):
         for time, time_next in tqdm.tqdm(time_pairs, desc="sampling loop time step"):
             batched_times = torch.full((batch_size,), time, device=x.F.device, dtype=torch.long)
             self_cond = x_start if self.self_condition else None
-            pred_noise, x_start = self.model_predictions(x, batched_times, self_cond, clip_x_start=True)
+            pred_noise, x_start = self.model_predictions(x, context, batched_times, self_cond, clip_x_start=True)
 
             if time_next < 0:
                 break
@@ -716,9 +718,9 @@ class GaussianDiffusion(nn.Module):
         return x_start
 
     @torch.no_grad()
-    def sample(self, x):
+    def sample(self, x, context):
         sample_fn = self.ddim_sample if self.is_ddim_sampling else self.p_sample_loop
-        return sample_fn(x)
+        return sample_fn(x, context)
 
     @property
     def loss_fn(self):
@@ -731,7 +733,7 @@ class GaussianDiffusion(nn.Module):
         else:
             raise ValueError(f"invalid loss type {self.loss_type}")
 
-    def p_losses(self, x_start, t):
+    def p_losses(self, x_start, context, t):
         # noise sample
         noise = set_feature(x_start, torch.randn_like(x_start.F))
         x = self.q_sample(x_start=x_start, t=t, noise=noise)
@@ -746,7 +748,7 @@ class GaussianDiffusion(nn.Module):
         #         x_self_cond.detach_()
 
         # predict and take gradient step
-        model_out = self.model(x, t)#, x_self_cond)
+        model_out = self.model(x, context, t)#, x_self_cond)
 
         if self.objective == "pred_noise":
             target = noise
@@ -761,14 +763,48 @@ class GaussianDiffusion(nn.Module):
         loss *= self.p2_loss_weight[t.long()][model_out.C[:, 0].long()]
         return loss.mean()
 
-    def forward(self, x, fix_t=None):
+    def forward(self, x, context, fix_t=None):
         batch_size = x.C[:, 0].int().max() + 1
         t = torch.randint(0, self.num_timesteps, (batch_size,), device=x.F.device).long()
         if fix_t:
             t *= 0
             t += fix_t
-        return self.p_losses(x, t)
+        return self.p_losses(x, context, t)
 
+
+
+
+class HoliCityPointCloudDataset(Dataset):
+    def __init__(self, rootdir):
+        self.pc_files = sorted(glob.glob(f"{rootdir}/point_clouds/*.npz"))
+        self.cond_files = sorted(glob.glob(f"{rootdir}/image_condition/*.pt"))
+        assert(len(self.cond_files) == (8 * len(self.pc_files)))
+
+    def __len__(self):
+        return len(self.cond_files)
+
+    def __getitem__(self, idx):
+        pc = np.load(self.pc_files[idx // 8])
+        coord = pc["coord"]
+        color = pc["color"]
+        cond = torch.load(self.cond_files[idx])
+        return coord, color, cond["mean"][0], cond["logvar"][0]
+
+
+
+class DiagonalGaussianDistribution(object):
+    def __init__(self, mean, logvar, deterministic=False):
+        self.mean, self.logvar = mean, logvar
+        self.logvar = torch.clamp(self.logvar, -30.0, 20.0)
+        self.deterministic = deterministic
+        self.std = torch.exp(0.5 * self.logvar)
+        self.var = torch.exp(self.logvar)
+        if self.deterministic:
+            self.var = self.std = torch.zeros_like(self.mean).to(device=self.mean.device)
+
+    def sample(self):
+        x = self.mean + self.std * torch.randn(self.mean.shape).to(device=self.mean.device)
+        return x
 
 
 
@@ -778,127 +814,37 @@ if __name__ == "__main__":
     import argparse
     import sys
 
-    sys.path.append("/cluster/project/cvg/zuoyue/torch-ngp")
-    from main_nerf import get_args
-
-    opt = get_args()
-
-    if opt.O:
-        opt.fp16 = True
-        opt.cuda_ray = True
-        opt.preload = True
-    
-    if opt.patch_size > 1:
-        opt.error_map = False # do not use error_map if use patch-based training
-        # assert opt.patch_size > 16, "patch_size should > 16 to run LPIPS loss."
-        assert opt.num_rays % (opt.patch_size ** 2) == 0, "patch_size ** 2 should be dividable by num_rays."
-
-
-    if opt.ff:
-        opt.fp16 = True
-        assert opt.bg_radius <= 0, "background model is not implemented for --ff"
-    elif opt.tcnn:
-        opt.fp16 = True
-        assert opt.bg_radius <= 0, "background model is not implemented for --tcnn"
-    else:
-        pass
-    
-    from nerf.provider import NeRFDataset
+    holicity_pc_dataset = HoliCityPointCloudDataset(
+        "/cluster/project/cvg/zuoyue/torch-ngp/data/holicity_recon_512x256_small_val"
+    )
+    train_loader = DataLoader(holicity_pc_dataset, batch_size=1, shuffle=True)
 
     scale = 10
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     func = lambda x: torch.cat([x, x[:1]], dim=0)
-    train_loader = NeRFDataset(opt, device=device, type="train").dataloader_my(batch_size=8)
 
-    # vals = [[], [], []]
-    # for data_idx, data in enumerate(train_loader):
-    #     pts = data['pts_coords'][data['pts_masks']].cpu()
-    #     for i in range(3):
-    #         val, bins = torch.histogram(pts[:, i], bins=400, range=(-200, 200))
-    #         vals[i].append(val)
-    #     print(data_idx)
-    # import matplotlib; matplotlib.use("agg")
-    # import matplotlib.pyplot as plt
-    # rs = [(-64, 64), (-64, 64), (-5, 27)]
-    # for i in range(3):
-    #     s = torch.stack(vals[i]).sum(dim=0).numpy()
-    #     plt.plot(bins.numpy()[:-1], s, "-")
-    #     plt.savefig(f"{i}.png")
-    #     plt.clf()
-    #     a, b = rs[i]
-    #     print(s[a+200: b+200].sum() / s.sum())
-    
-    # quit()
-
-    # for data in train_loader:
-    #     pts = data['pts_coords'][data['pts_masks']].to(device)
-    #     pts_batch = data['pts_batch'][data['pts_masks']].unsqueeze(-1).to(device)
-    #     feats = func(data['pts_rgbs'][data['pts_masks']]).to(device)
-    #     coords = func(torch.cat([pts_batch, pts * scale], dim=-1))
-    #     pts_field = ME.TensorField(
-    #         features=feats * 2 - 1, # in a range of -1 to 1
-    #         coordinates=coords,
-    #         quantization_mode=ME.SparseTensorQuantizationMode.UNWEIGHTED_AVERAGE,
-    #         minkowski_algorithm=ME.MinkowskiAlgorithm.SPEED_OPTIMIZED,
-    #         device=pts.device,
-    #     )
-    #     pts_sparse = pts_field.sparse()
-    #     torch.save({
-    #         "features": pts_sparse.F,
-    #         "coordinates": pts_sparse.C,
-    #     }, f"test_point_cloud_scale_20.pt")
-    # quit()
-
-    # count = 0
-    # for data in train_loader:
-    #     with open(f'test_newsurface/datavis/{count:04d}.txt', 'w') as f:
-    #         for (x, y, z), (r, g, b) in zip(
-    #             data['pts_coords'][data['pts_masks']].cpu().numpy(),
-    #             (255 * data['pts_rgbs'][data['pts_masks']].cpu().numpy()).astype(np.uint8),
-    #         ):
-    #             f.write('%.3lf %.3lf %.3lf %d %d %d\n' % (x, y, z, r, g, b))
-    #         count += 1
-    #         # if count % 8 == 0:
-    #         input('check')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--diff_arg_dataset', type=str, default='train')
+    parser.add_argument('--diff_arg_net_attention', type=str, default=None)
+    parser.add_argument('--diff_arg_folder', type=str)
+    parser.add_argument('--diff_arg_ckpt', type=str, default=None)
+    parser.add_argument('--diff_arg_sampling_steps', type=int, default=1000)
+    parser.add_argument('--random_x_flip', action='store_true')
+    parser.add_argument('--random_y_flip', action='store_true')
+    parser.add_argument('--random_z_rotate', action='store_true')
+    parser.add_argument('--random_gamma_correction', action='store_true')
+    opt = parser.parse_args()
 
     net = MinkUNet(3, 3, time_channels=32, attns=opt.diff_arg_net_attention).to(device)
     diffusion_model = GaussianDiffusion(net, sampling_timesteps=opt.diff_arg_sampling_steps).to(device)
 
-    optimizer = torch.optim.Adam(diffusion_model.parameters(), lr=1e-3, betas=(0.9, 0.99))
+    optimizer = torch.optim.Adam(diffusion_model.parameters(), lr=3e-4, betas=(0.9, 0.99))
 
-    # folder = "test190furtherperturb"
-    # folder = "test1520newsurface"
-    # folder = "test1520constdepth"
-    # folder = "test190dataaug"
-    # folder = "test1520dataaugattn2"
     folder = opt.diff_arg_folder
     if opt.diff_arg_ckpt is not None:
         diffusion_model.load_state_dict(torch.load(f"{folder}/{opt.diff_arg_ckpt}"))
-        import os
-        os.system(f"mkdir {folder}/datavis")
-
-    # pcfiles = sorted(glob.glob("/home/lzq/lzy/torch-ngp/data/holicity_single_view/point_clouds/*.txt"))#[:640]
-    # pcfiles = pcfiles[632:648] + pcfiles[1528:1536]
-
-    # from make_ngp_singleview_dataset import HoliCityDataset
-    # dataset = HoliCityDataset('/home/lzq/lzy/HoliCity', 'train', since_month='2018-01')
-
-    # pcfiles = sorted(
-    #     [f"/home/lzq/lzy/torch-ngp/data/holicity_single_view/point_clouds/{file.split('/')[-1]}.txt" for file in dataset.filelist[:680]]
-    # )[:24]
-
-    # import os
-    # with open("/home/lzq/lzy/torch-ngp/data/holicity_single_view/transforms.json", 'r') as f:
-    #     names = [f['file_path'].split("/")[-1].replace(".jpg", "") for f in json.load(f)["frames"]]
-    # pcfiles = [f"/home/lzq/lzy/torch-ngp/data/holicity_single_view/point_clouds/{name}.txt" for name in names][:1520]
-    # pcfiles = pcfiles[:1520]
-    # pcfiles.sort(key=lambda x: os.path.getmtime(x))
-    # import os
-    # for pcfile in pcfiles:
-    #     if not os.path.exists(pcfile):
-    #         # print(os.path.getmtime(pcfile), pcfile)
-    #         print(pcfile)
-    # quit()
+        # import os
+        # os.system(f"mkdir {folder}/datavis")
 
     logger_file = "log.txt" if opt.diff_arg_dataset == "train" else "log_no.txt"
     num_epochs = 99999 if opt.diff_arg_dataset == "train" else 1
@@ -906,22 +852,14 @@ if __name__ == "__main__":
     with open(f"{folder}/{logger_file}", "w") as f:
         for epoch in range(0, num_epochs):
             data_idx = 0
-            # diffusion_model.load_state_dict(torch.load(f"{folder}/epoch{epoch}.pt"))
-            for data in train_loader:
-            # for pcfile in pcfiles:
 
-                # if not os.path.exists(pcfile):
-                #     continue
+            for pts, feats, mean, logvar in train_loader:
+
+                pts = pts.to(device)[0].float()
+                feats = feats.to(device)[0].float() / 255.0
+                distribution = DiagonalGaussianDistribution(mean.to(device).float(), logvar.to(device).float())
 
                 optimizer.zero_grad(set_to_none=True)
-
-                pts = data['pts_coords'][data['pts_masks']].to(device)
-                pts_batch = data['pts_batch'][data['pts_masks']].unsqueeze(-1).to(device) * 0
-                feats = data['pts_rgbs'][data['pts_masks']].to(device)
-                # data = np.loadtxt(pcfile)
-                # pts = torch.from_numpy(data[:,:3]).to(device)
-                # pts_batch = pts[:,0:1] * 0
-                # feats = torch.from_numpy(data[:,3:]).float().to(device) / 255.0
 
                 if opt.random_x_flip and np.random.rand() < 0.5:
                     pts[:, 0] *= -1
@@ -941,65 +879,43 @@ if __name__ == "__main__":
                 if opt.random_gamma_correction:
                     assert(feats.min() >= 0)
                     assert(feats.max() <= 1)
-                    max_gamma = 1.6
+                    max_gamma = 1.25
                     gamma = np.random.rand() * (max_gamma - 1) + 1
                     if np.random.rand() < 0.5:
                         gamma = 1.0 / gamma
                     feats = feats ** gamma
 
-                if False: # crop point cloud, only closer points are kept
-                    close_pts_mask = torch.sqrt((pts ** 2).sum(dim=1)) < 50
-                    pts = pts[close_pts_mask]
-                    pts_batch = pts_batch[close_pts_mask]
-                    feats = feats[close_pts_mask]
-                
-                if False: # randomly disturb the location
-                    pts = pts + torch.rand_like(pts) / scale
-
-                coords = func(torch.cat([pts_batch, pts * scale], dim=-1))
+                coords = func(torch.cat([pts[:, :1] * 0, pts * scale], dim=-1))
                 feats = func(feats)
                 pts_field = ME.TensorField(
-                    features=feats * 2 - 1, # in a range of -1 to 1
                     coordinates=coords,
+                    features=feats * 2 - 1, # in a range of -1 to 1
                     quantization_mode=ME.SparseTensorQuantizationMode.UNWEIGHTED_AVERAGE,
                     minkowski_algorithm=ME.MinkowskiAlgorithm.SPEED_OPTIMIZED,
                     device=pts.device,
                 )
                 pts_sparse = pts_field.sparse()
 
-                if False: # select xxx% of the points
-                    perm = torch.randperm(pts_sparse.F.shape[0])
-                    bound = int(pts_sparse.F.shape[0] * 0.25)
-                    pts_sparse = ME.SparseTensor(
-                        features=pts_sparse.F[perm[:bound]],
-                        coordinates=pts_sparse.C[perm[:bound]],
-                        device=pts.device,
-                    )
-                
-                # for gamma in [1/5, 1/4, 1/3, 1/2, 1, 2, 3, 4, 5]:
-                #     with open(f"{folder}/datavis/data_gamma_{gamma:02f}.txt", "w") as f:
-                #         for (_, x, y, z), (r, g, b) in zip(
-                #             pts_sparse.C.cpu().numpy(),
-                #             ((((pts_sparse.F + 1) / 2) ** gamma) * 255).cpu().numpy().astype(np.uint8),
-                #         ):
-                #             f.write('%.3lf %.3lf %.3lf %d %d %d\n' % (x, y, z, r, g, b))
-                # quit()
-
                 if opt.diff_arg_dataset != "train":
                     with torch.no_grad():
-                        pred = diffusion_model.sample(pts_sparse)
+                        pred = diffusion_model.sample(pts_sparse, distribution.sample().reshape(1, 4, -1).transpose(1, 2))
                         with open(f"{folder}/datavis/data_{data_idx}.txt", "w") as f:
                             for (_, x, y, z), (r, g, b) in zip(
                                 pred.C.cpu().numpy(),
                                 (torch.clamp(pred.F, -1, 1) * 127.5 + 127.5).cpu().numpy().astype(np.uint8),
                             ):
                                 f.write('%.3lf %.3lf %.3lf %d %d %d\n' % (x, y, z, r, g, b))
+                        with open(f"{folder}/datavis/data_{data_idx}_gt.txt", "w") as f:
+                            for (_, x, y, z), (r, g, b) in zip(
+                                pts_sparse.C.cpu().numpy(),
+                                (torch.clamp(pts_sparse.F, -1, 1) * 127.5 + 127.5).cpu().numpy().astype(np.uint8),
+                            ):
+                                f.write('%.3lf %.3lf %.3lf %d %d %d\n' % (x, y, z, r, g, b))
                     data_idx += 1
                     continue
 
-                # for ttt in [100, 300, 500, 700, 900]:
                 optimizer.zero_grad(set_to_none=True)
-                loss = diffusion_model(pts_sparse)#, fix_t=ttt)
+                loss = diffusion_model(pts_sparse, distribution.sample().reshape(1, 4, -1).transpose(1, 2))
                 print(epoch, loss.item())
                 f.write(f"{epoch}\t{loss}\n")
                 f.flush()
@@ -1007,6 +923,6 @@ if __name__ == "__main__":
 
                 optimizer.step()
 
-            if epoch % 10 == 0:
+            if epoch % 1 == 0:
                 state_dict = diffusion_model.state_dict()
                 torch.save(state_dict, f"{folder}/epoch{epoch}.pt")
