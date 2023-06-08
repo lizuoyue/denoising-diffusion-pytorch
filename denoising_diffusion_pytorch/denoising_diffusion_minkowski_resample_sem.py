@@ -7,24 +7,41 @@ import tqdm
 import glob, json, os
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
+import matplotlib; matplotlib.use("agg")
+import matplotlib.pyplot as plt
 
-def set_feature(x, features):
+def set_feature(x, features, same_manager=True):
     assert(x.F.shape[0] == features.shape[0])
     if isinstance(x, ME.TensorField):
-        return ME.TensorField(
-            features=features.to(x.device),
-            coordinate_field_map_key=x.coordinate_field_map_key,
-            coordinate_manager=x.coordinate_manager,
-            quantization_mode=x.quantization_mode,
-            device=x.device,
-        )
+        if same_manager:
+            return ME.TensorField(
+                features=features.to(x.device),
+                coordinate_field_map_key=x.coordinate_field_map_key,
+                coordinate_manager=x.coordinate_manager,
+                quantization_mode=x.quantization_mode,
+                device=x.device,
+            )
+        else:
+            return ME.TensorField(
+                features=features.to(x.device),
+                coordinates=x.C,
+                quantization_mode=x.quantization_mode,
+                device=x.device,
+            )
     elif isinstance(x, ME.SparseTensor):
-        return ME.SparseTensor(
-            features=features.to(x.device),
-            coordinate_map_key=x.coordinate_map_key,
-            coordinate_manager=x.coordinate_manager,
-            device=x.device,
-        )
+        if same_manager:
+            return ME.SparseTensor(
+                features=features.to(x.device),
+                coordinate_map_key=x.coordinate_map_key,
+                coordinate_manager=x.coordinate_manager,
+                device=x.device,
+            )
+        else:
+            return ME.SparseTensor(
+                features=features.to(x.device),
+                coordinates=x.C,
+                device=x.device,
+            )
     else:
         pass
     raise ValueError("Input tensor is not ME.TensorField nor ME.SparseTensor.")
@@ -76,6 +93,30 @@ class BatchedMinkowski(nn.Module):
 
     def forward(self, x):
         return set_feature(x, self.module(x.F))
+
+
+class LinearBlock(nn.Module):
+
+    def __init__(self, ch_in, ch_out, groups=8, act="SiLU"):
+        super().__init__()
+        self.conv = ME.MinkowskiLinear(ch_in, ch_out)
+        self.norm = UnbatchedMinkowski(
+            nn.GroupNorm(num_groups=groups, num_channels=ch_out)
+        )
+        if act is None or act == "":
+            self.act = Identity()
+        else:
+            assert(type(act) == str)
+            self.act = getattr(torch.nn.functional, act.lower())
+
+    def forward(self, x, scale_shift=None):
+        x = self.conv(x)
+        x = self.norm(x)
+        if scale_shift is not None:
+            scale, shift = scale_shift
+            idx = x.C[:, 0].long() # batch index
+            x = set_feature(x, x.F * (scale[idx] + 1) + shift[idx])
+        return set_feature(x, self.act(x.F))
 
 
 class ConvBlock(nn.Module):
@@ -396,10 +437,13 @@ class MinkUNet(nn.Module):
             if isinstance(m, ME.MinkowskiConvolution):
                 ME.utils.kaiming_normal_(m.kernel, mode="fan_out", nonlinearity="relu")
 
-    def forward(self, x, times=None):
+    def forward(self, x, times=None, x_self_cond=None):
         time_emb = None
         if self.time_mlp is not None and times is not None:
             time_emb = self.time_mlp(times)
+        
+        if x_self_cond is not None:
+            x = ME.cat(x, x_self_cond)
 
         x = self.init_conv(x)
         stack = [x]
@@ -419,7 +463,6 @@ class MinkUNet(nn.Module):
                 x = ME.cat(x, stack.pop())
                 x = block(x, time_emb=time_emb)
                 x = attn(x)
-            
             x = up(x)
         
         x = ME.cat(x, stack.pop())
@@ -432,7 +475,7 @@ class MinkFieldUNet(MinkUNet):
 
     def init_network(self, in_channels, out_channels, time_channels=None):
         field_ch1 = 32
-        field_ch2 = 32
+        field_ch2 = 64
         self.field_network1 = nn.Sequential(
             ME.MinkowskiSinusoidal(in_channels, field_ch1),
             UnbatchedMinkowski(nn.GroupNorm(num_groups=8, num_channels=field_ch1)),
@@ -443,21 +486,26 @@ class MinkFieldUNet(MinkUNet):
         )
         self.field_network2 = nn.Sequential(
             ME.MinkowskiSinusoidal(field_ch1 + in_channels, field_ch2),
-            UnbatchedMinkowski(nn.GroupNorm(num_groups=8, num_channels=field_ch1)),
+            UnbatchedMinkowski(nn.GroupNorm(num_groups=8, num_channels=field_ch2)),
             BatchedMinkowski(nn.GELU()),
             ME.MinkowskiLinear(field_ch2, field_ch2),
-            UnbatchedMinkowski(nn.GroupNorm(num_groups=8, num_channels=field_ch1)),
+            UnbatchedMinkowski(nn.GroupNorm(num_groups=8, num_channels=field_ch2)),
             BatchedMinkowski(nn.GELU()),
         )
-        MinkUNet.init_network(self, field_ch2, out_channels, time_channels)
+        self.field_final_block = LinearBlock(field_ch2 * 2, field_ch1)
+        self.field_final = ME.MinkowskiLinear(field_ch1, out_channels)
+        MinkUNet.init_network(self, field_ch2, field_ch2, time_channels)
 
-    def forward(self, x: ME.TensorField, times=None):
+    def forward(self, x: ME.TensorField, times=None, x_self_cond=None):
+        if x_self_cond is not None:
+            x = ME.cat(x, x_self_cond)
         otensor1 = self.field_network1(x)
         otensor1 = ME.cat(otensor1, x)
         otensor2 = self.field_network2(otensor1)
-        otensor2 = otensor2.sparse()
-        out = MinkUNetBase.forward(self, otensor2, times)
-        return out.slice(x)
+        out = MinkUNet.forward(self, otensor2.sparse(), times)
+        out_field = out.slice(x)
+        out2 = self.field_final_block(ME.cat(out_field, otensor2))
+        return self.field_final(out2)
 
 
 def linear_beta_schedule(timesteps):
@@ -502,6 +550,14 @@ def extract(param, times, x):
     assert(len(times.shape) == 1)
     return set_feature(x, param[times.long()][x.C[:, 0].long()][:, None])
 
+def has_same_map_key(a, b):
+    if isinstance(a, ME.TensorField):
+        return a.coordinate_field_map_key == b.coordinate_field_map_key
+    elif isinstance(a, ME.SparseTensor):
+        return a.coordinate_map_key == b.coordinate_map_key
+    else:
+        assert(False)
+    return None
 
 class GaussianDiffusion(nn.Module):
     def __init__(
@@ -509,6 +565,7 @@ class GaussianDiffusion(nn.Module):
         model,
         timesteps=1000,
         sampling_timesteps=1000,
+        self_condition=False,
         loss_type="smooth_l1",
         objective="pred_noise",
         beta_schedule="sigmoid",
@@ -520,7 +577,7 @@ class GaussianDiffusion(nn.Module):
         super().__init__()
 
         self.model = model
-        self.self_condition = False
+        self.self_condition = self_condition
 
         self.objective = objective
 
@@ -582,35 +639,35 @@ class GaussianDiffusion(nn.Module):
         register_buffer('p2_loss_weight', (p2_loss_weight_k + alphas_cumprod / (1. - alphas_cumprod)) ** -p2_loss_weight_gamma)
     
     def predict_start_from_noise(self, x_t, t, noise):
-        assert(x_t.coordinate_map_key == noise.coordinate_map_key)
+        assert(has_same_map_key(x_t, noise))
         return (
             extract(self.sqrt_recip_alphas_cumprod, t, x_t) * x_t -
             extract(self.sqrt_recipm1_alphas_cumprod, t, noise) * noise
         )
 
     def predict_noise_from_start(self, x_t, t, x_0):
-        assert(x_t.coordinate_map_key == x_0.coordinate_map_key)
+        assert(has_same_map_key(x_t, x_0))
         return (
             (extract(self.sqrt_recip_alphas_cumprod, t, x_t) * x_t - x_0) / \
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t)
         )
 
     def predict_v(self, x_start, t, noise):
-        assert(x_start.coordinate_map_key == noise.coordinate_map_key)
+        assert(has_same_map_key(x_start, noise))
         return (
             extract(self.sqrt_alphas_cumprod, t, noise) * noise -
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start) * x_start
         )
 
     def predict_start_from_v(self, x_t, t, v):
-        assert(x_t.coordinate_map_key == v.coordinate_map_key)
+        assert(has_same_map_key(x_t, v))
         return (
             extract(self.sqrt_alphas_cumprod, t, x_t) * x_t -
             extract(self.sqrt_one_minus_alphas_cumprod, t, v) * v
         )
 
     def q_posterior(self, x_start, x_t, t):
-        assert(x_start.coordinate_map_key == x_t.coordinate_map_key)
+        assert(has_same_map_key(x_start, x_t))
         posterior_mean = (
             extract(self.posterior_mean_coef1, t, x_start) * x_start +
             extract(self.posterior_mean_coef2, t, x_t) * x_t
@@ -623,15 +680,26 @@ class GaussianDiffusion(nn.Module):
         if noise is None:
             noise = set_feature(x_start, torch.randn_like(x_start.F))
         else:
-            assert(x_start.coordinate_map_key == noise.coordinate_map_key)
+            assert(has_same_map_key(x_start, noise))
         return (
             extract(self.sqrt_alphas_cumprod, t, x_start) * x_start +
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start) * noise
         )
 
-    def model_predictions(self, x, t, x_self_cond=None, clip_x_start=False):
-        model_output = self.model(x, t)#, x_self_cond)
+    def model_predictions(self, x, t, x_self_cond=None, mask_info=None, clip_x_start=False):
+
+        if mask_info is not None:
+            # mask_info == 0 means known info
+            # mask_info == 1 means to be generated
+            x_num_channel = x.F.shape[1]
+            masked_start = x.F * (1 - mask_info)
+            x = set_feature(x, torch.cat([x.F, masked_start, mask_info], dim=-1))
+
+        model_output = self.model(x, t, x_self_cond)
         clip = BatchedMinkowski(lambda y: torch.clamp(y, -1., 1.)) if clip_x_start else Identity()
+
+        if mask_info is not None:
+            x = set_feature(x, x.F[:, :x_num_channel])
 
         if self.objective == "pred_noise":
             pred_noise = model_output
@@ -654,29 +722,32 @@ class GaussianDiffusion(nn.Module):
 
         return pred_noise, x_start
 
-    def p_mean_variance(self, x, t, x_self_cond=None, clip_denoised=True):
-        pred_noise, x_start = self.model_predictions(x, t, x_self_cond, clip_denoised)
+    def p_mean_variance(self, x, t, x_self_cond=None, mask_info=None, clip_denoised=True):
+        pred_noise, x_start = self.model_predictions(x, t, x_self_cond, mask_info, clip_denoised)
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_start, x_t=x, t=t)
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.no_grad()
-    def p_sample(self, x, t: int, x_self_cond=None):
+    def p_sample(self, x, t: int, x_self_cond=None, mask_info=None):
         batch_size = x.C[:, 0].int().max() + 1
         batched_times = torch.full((batch_size,), t, device=x.F.device, dtype=torch.long)
         model_mean, _, model_log_variance, x_start = self.p_mean_variance(
-            x=x, t=batched_times, x_self_cond=x_self_cond, clip_denoised=True
+            x=x, t=batched_times, x_self_cond=x_self_cond, mask_info=mask_info, clip_denoised=True
         )
         noise = set_feature(x, torch.randn_like(x.F) if t > 0 else torch.zeros_like(x.F)) # no noise if t == 0
         pred_back = model_mean + set_feature(model_log_variance, (0.5 * model_log_variance.F).exp()) * noise
         return pred_back, x_start
 
     @torch.no_grad()
-    def p_sample_loop(self, x):
+    def p_sample_loop(self, x, mask_info=None):
         x = set_feature(x, torch.randn_like(x.F))
-        x_start = None
+        x_start = set_feature(x, torch.zeros_like(x.F)) if self.self_condition else None
         for t in tqdm.tqdm(reversed(range(0, self.num_timesteps)), desc="sampling loop time step", total=self.num_timesteps):
             self_cond = x_start if self.self_condition else None
-            x, x_start = self.p_sample(x, t, self_cond)
+            x, x_start = self.p_sample(x, t, self_cond, mask_info)
+
+            x = set_feature(x, x.F, same_manager=False)
+            x_start = set_feature(x, x_start.F)
             # if t % 50 == 0:
             #     with open(f'testoverfit80/{t}.txt', 'w') as f:
             #         for (_, xx, yy, zz), (r, g, b) in zip(
@@ -687,7 +758,7 @@ class GaussianDiffusion(nn.Module):
         return x
 
     @torch.no_grad()
-    def ddim_sample(self, x): # for faster sampling
+    def ddim_sample(self, x, mask_info=None): # for faster sampling
         batch_size = x.C[:, 0].int().max() + 1
         times = torch.linspace(-1, self.num_timesteps-1, steps=self.sampling_timesteps+1)
         # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == num_timesteps
@@ -695,11 +766,11 @@ class GaussianDiffusion(nn.Module):
         time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
 
         x = set_feature(x, torch.randn_like(x.F))
-        x_start = None
+        x_start = set_feature(x, torch.zeros_like(x.F)) if self.self_condition else None
         for time, time_next in tqdm.tqdm(time_pairs, desc="sampling loop time step"):
             batched_times = torch.full((batch_size,), time, device=x.F.device, dtype=torch.long)
             self_cond = x_start if self.self_condition else None
-            pred_noise, x_start = self.model_predictions(x, batched_times, self_cond, clip_x_start=True)
+            pred_noise, x_start = self.model_predictions(x, batched_times, self_cond, mask_info, clip_x_start=True)
 
             if time_next < 0:
                 break
@@ -712,13 +783,16 @@ class GaussianDiffusion(nn.Module):
             x = set_feature(x_start, x_start.F * alpha_next.sqrt()) + \
                 set_feature(pred_noise, c * pred_noise.F) + \
                 set_feature(x, sigma * torch.randn_like(x.F))
+            
+            x = set_feature(x, x.F, same_manager=False)
+            x_start = set_feature(x, x_start.F)
 
         return x_start
 
     @torch.no_grad()
-    def sample(self, x):
+    def sample(self, x, mask_info=None):
         sample_fn = self.ddim_sample if self.is_ddim_sampling else self.p_sample_loop
-        return sample_fn(x)
+        return sample_fn(x, mask_info)
 
     @property
     def loss_fn(self):
@@ -731,7 +805,7 @@ class GaussianDiffusion(nn.Module):
         else:
             raise ValueError(f"invalid loss type {self.loss_type}")
 
-    def p_losses(self, x_start, t, spatial_weight=None):
+    def p_losses(self, x_start, t, spatial_weight=None, mask_info=None):
         # noise sample
         noise = set_feature(x_start, torch.randn_like(x_start.F))
         x = self.q_sample(x_start=x_start, t=t, noise=noise)
@@ -739,14 +813,24 @@ class GaussianDiffusion(nn.Module):
         # if doing self-conditioning, 50% of the time, predict x_start from current set of times
         # and condition with unet with that
         # this technique will slow down training by 25%, but seems to lower FID significantly
-        # x_self_cond = None
-        # if self.self_condition and np.random() < 0.5:
-        #     with torch.no_grad():
-        #         _, x_self_cond = self.model_predictions(x, t)
-        #         x_self_cond.detach_()
+        x_self_cond = None
+        if self.self_condition:
+            if np.random.rand() < 0.5:
+                with torch.no_grad():
+                    x_copy = set_feature(x, x.F, same_manager=False)
+                    _, x_self_cond = self.model_predictions(x_copy, t, set_feature(x_copy, torch.zeros_like(x.F)))
+                    x_self_cond = set_feature(x, x_self_cond.F.detach())
+            else:
+                x_self_cond = set_feature(x, torch.zeros_like(x.F))
 
         # predict and take gradient step
-        model_out = self.model(x, t)#, x_self_cond)
+        if mask_info is not None:
+            # mask_info == 0 means known info
+            # mask_info == 1 means to be generated
+            masked_start = x_start.F * (1 - mask_info)
+            x = set_feature(x, torch.cat([x.F, masked_start, mask_info], dim=-1))
+
+        model_out = self.model(x, t, x_self_cond)
 
         if self.objective == "pred_noise":
             target = noise
@@ -758,6 +842,10 @@ class GaussianDiffusion(nn.Module):
             raise ValueError(f'unknown objective {self.objective}')
 
         loss = self.loss_fn(model_out.F, target.F, reduction="none")
+
+        if mask_info is not None:
+            loss = loss * (mask_info + 0.1) # 0.1 vs 1.1
+
         if spatial_weight is None:
             loss = loss.mean(dim=1)
         else:
@@ -766,13 +854,13 @@ class GaussianDiffusion(nn.Module):
         loss *= self.p2_loss_weight[t.long()][model_out.C[:, 0].long()]
         return loss.mean()
 
-    def forward(self, x, fix_t=None, spatial_weight=None):
+    def forward(self, x, fix_t=None, spatial_weight=None, mask_info=None):
         batch_size = x.C[:, 0].int().max() + 1
         t = torch.randint(0, self.num_timesteps, (batch_size,), device=x.F.device).long()
         if fix_t:
             t *= 0
             t += fix_t
-        return self.p_losses(x, t, spatial_weight)
+        return self.p_losses(x, t, spatial_weight, mask_info)
 
 
 
@@ -789,7 +877,20 @@ class HoliCityPointCloudDataset(Dataset):
         coord = pc["coord"]
         color = pc["color"]
         dist = pc["dist"]
-        return coord, color, dist
+        sem = pc["sem"]
+        is_not_ground = pc["geo_is_not_ground"]
+        return coord, color, dist, sem, is_not_ground
+
+
+def get_param_generator(model, model_dict):
+    for name, param in model.named_parameters():
+        if name not in model_dict or param.shape != model_dict[name].shape:
+            yield param
+
+def update_model_dict(model, model_dict):
+    for name, param in model.named_parameters():
+        if name in model_dict and param.shape != model_dict[name].shape:
+            model_dict.pop(name)
 
 
 def xyz2lonlatdist(coord):
@@ -901,35 +1002,51 @@ if __name__ == "__main__":
     parser.add_argument('--dataset_folder', type=str)
     parser.add_argument('--dataset_mode', type=str, default='train')
     parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--num_epoch', type=float, default=300)
+    parser.add_argument('--num_epoch', type=int, default=20)
     parser.add_argument('--net_attention', type=str, default=None)
     parser.add_argument('--work_folder', type=str)
+    parser.add_argument('--point_scale', type=int)
     parser.add_argument('--ckpt', type=str, default=None)
+    parser.add_argument('--ckpt_not_strict', action='store_true')
+    parser.add_argument('--num_sample', type=int, default=3)
     parser.add_argument('--sampling_steps', type=int, default=1000)
     parser.add_argument('--random_x_flip', action='store_true')
     parser.add_argument('--random_y_flip', action='store_true')
     parser.add_argument('--random_z_rotate', action='store_true')
     parser.add_argument('--random_gamma_correction', action='store_true')
+    parser.add_argument('--self_condition', action='store_true')
+    parser.add_argument('--field_network', action='store_true')
+    parser.add_argument('--masked_generation', type=float, default=0.0) # ratio of known infomation
     parser.add_argument('--save_gt', action='store_true')
     parser.add_argument('--use_ema', action='store_true')
+    parser.add_argument('--save_every_epoch', type=int, default=1)
     
     opt = parser.parse_args()
 
     holicity_pc_dataset = HoliCityPointCloudDataset(opt.dataset_folder)
     is_train = opt.dataset_mode == "train"
-    train_loader = DataLoader(holicity_pc_dataset, batch_size=1, shuffle=is_train)
+    data_loader = DataLoader(holicity_pc_dataset, batch_size=1, shuffle=is_train)
 
-    scale = 10
+    scale = opt.point_scale
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     func = lambda x: torch.cat([x, x[:1]], dim=0)
 
-    net = MinkUNet(3, 3, time_channels=32, attns=opt.net_attention).to(device)
-    diffusion_model = GaussianDiffusion(net, sampling_timesteps=opt.sampling_steps).to(device)
+    in_channels = 3 * (opt.self_condition + 1) + (opt.masked_generation > 0) * 4
+    SelectedNetwork = MinkUNet
+    if opt.field_network:
+        SelectedNetwork = MinkFieldUNet
+    
+    net = SelectedNetwork(in_channels, 3, time_channels=32, attns=opt.net_attention).to(device)
+    diffusion_model = GaussianDiffusion(
+        net, sampling_timesteps=opt.sampling_steps, self_condition=opt.self_condition
+    ).to(device)
 
     if opt.use_ema:
         from ema_pytorch import EMA
-        ema_net = MinkUNet(3, 3, time_channels=32, attns=opt.net_attention).to(device)
-        ema_diffusion_model = GaussianDiffusion(ema_net, sampling_timesteps=opt.sampling_steps).to(device)
+        ema_net = SelectedNetwork(in_channels, 3, time_channels=32, attns=opt.net_attention).to(device)
+        ema_diffusion_model = GaussianDiffusion(
+            ema_net, sampling_timesteps=opt.sampling_steps, self_condition=opt.self_condition
+        ).to(device)
         ema_model = EMA(
             model=diffusion_model,
             ema_model=ema_diffusion_model,
@@ -938,36 +1055,50 @@ if __name__ == "__main__":
             update_every=20,          # how often to actually update, to save on compute (updates every 10th .update() call)
         )
 
-    optimizer = torch.optim.Adam(diffusion_model.parameters(), lr=opt.lr, betas=(0.9, 0.99))
-    scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.2, total_iters=opt.num_epoch)
-
     folder = opt.work_folder
     start_epoch = 0
+    trainable_params = diffusion_model.parameters()
     if is_train and opt.ckpt is not None:
         model_dict = torch.load(f"{folder}/{opt.ckpt}")
-        diffusion_model.load_state_dict(model_dict["model"])
+        if opt.ckpt_not_strict:
+            trainable_params = get_param_generator(diffusion_model, model_dict["model"])
+            update_model_dict(diffusion_model, model_dict["model"])
+            update_model_dict(ema_model, model_dict["ema_model"])
+        diffusion_model.load_state_dict(model_dict["model"], strict=not opt.ckpt_not_strict)
         if opt.use_ema:
-            ema_model.load_state_dict(model_dict["ema_model"])
-        # start_epoch = model_dict["epoch"]
+            ema_model.load_state_dict(model_dict["ema_model"], strict=not opt.ckpt_not_strict)
+        if "epoch" in model_dict:
+            start_epoch = model_dict["epoch"]
+
+    optimizer = torch.optim.Adam(trainable_params, lr=opt.lr, betas=(0.9, 0.99))
+    scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.2, total_iters=opt.num_epoch)
+
     import os
     os.system(f"mkdir -p {folder}/datavis")
 
     logger_file = f"log_{opt.dataset_mode}.txt"
     num_epochs = opt.num_epoch if is_train else 1
 
+    spatial_weight, mask_info = None, None
+
     with open(f"{folder}/{logger_file}", "a") as f:
         for epoch in range(0, num_epochs):
 
-            if is_train and epoch < start_epoch:
+            if is_train and epoch <= start_epoch:
+                optimizer.zero_grad(set_to_none=True)
+                optimizer.step()
                 scheduler.step()
                 continue
 
             data_idx = 0
-            for pts, feats, dists in train_loader:
+            for pts, feats, dists, sem, geo_nonground in data_loader:
 
                 pts = pts.to(device)[0].float()
                 feats = feats.to(device)[0].float() / 255.0
                 dists = dists.to(device)[0].float()
+                sem = sem.to(device)[0].long()
+                sem = torch.nn.functional.one_hot(sem, num_classes=19).float()
+                geo_nonground = geo_nonground.to(device)[0].float()
 
                 if opt.random_x_flip and np.random.rand() < 0.5:
                     pts[:, 0] *= -1
@@ -977,12 +1108,12 @@ if __name__ == "__main__":
                 
                 if opt.random_z_rotate:
                     rand_theta = np.random.rand() * 2 * np.pi
-                    pts = torch.Tensor([
+                    rand_rotmat = torch.Tensor([
                         [np.cos(rand_theta), -np.sin(rand_theta), 0],
                         [np.sin(rand_theta), np.cos(rand_theta), 0],
                         [0, 0, 1],
-                    ]).float().to(pts.device) @ pts.transpose(0, 1)
-                    pts = pts.transpose(0, 1)
+                    ]).float().to(pts.device)
+                    pts = pts @ rand_rotmat.transpose(0, 1)
                 
                 if opt.random_gamma_correction:
                     assert(feats.min() >= 0)
@@ -996,8 +1127,19 @@ if __name__ == "__main__":
                 coords = func(torch.cat([pts[:, :1] * 0, pts * scale], dim=-1))
                 feats = torch.cat([
                     feats * 2 - 1, # in a range of -1 to 1
+                    sem,
+                    geo_nonground[..., None],
                     dists[..., None],
                 ], dim=-1)
+
+                if opt.masked_generation > 0:
+                    assert(opt.random_z_rotate)
+                    pano_coord = xyz2coord(pts)
+                    # pano_coord[:, :1] from -2 to 2
+                    known_th = -2.0 + 4.0 * opt.masked_generation
+                    mask_info = (pano_coord[:, :1] > known_th).float() # right half to be generated
+                    feats = torch.cat([feats, mask_info], dim=-1)
+
                 feats = func(feats)
 
                 pts_field = ME.TensorField(
@@ -1007,25 +1149,67 @@ if __name__ == "__main__":
                     minkowski_algorithm=ME.MinkowskiAlgorithm.SPEED_OPTIMIZED,
                     device=pts.device,
                 )
-                pts_sparse = pts_field.sparse()
+
+                if opt.field_network:
+                    pts_sparse = pts_field
+                else:
+                    pts_sparse = pts_field.sparse()
+
                 spatial_weight = torch.exp(-pts_sparse.F[:, -1:])
-                pts_sparse = set_feature(pts_sparse, pts_sparse.F[:, :-1])
+                spatial_sem = torch.argmax(pts_sparse.F[:, 3: 22], dim=-1)
+                spatial_geo_nonground = pts_sparse.F[:, 22] > 0.5
+                spatial_geo_ground = ~spatial_geo_nonground
+
+                # [
+                #     '0 road', '1 sidewalk', '2 building', '3 wall', 'fence', 'pole',
+                #     'traffic light', 'traffic sign', 'vegetation', '9 terrain', 'sky',
+                #     'person', 'rider', 'car', 'truck', 'bus', 'train', 'motorcycle',
+                #     'bicycle'
+                # ]
+
+                to_preserve = (spatial_geo_ground & (spatial_sem == 0)) | \
+                    (spatial_geo_ground & (spatial_sem == 1)) | \
+                    (spatial_geo_ground & (spatial_sem == 9)) | \
+                    (spatial_geo_nonground & (spatial_sem == 2)) | \
+                    (spatial_geo_nonground & (spatial_sem == 3))
+                to_remove = ~to_preserve
+                spatial_weight[to_remove] = 0
+
+                if opt.masked_generation:
+                    mask_info = pts_sparse.F[:, -1:]
+                
+                pts_sparse = set_feature(pts_sparse, pts_sparse.F[:, :3])
 
                 if opt.save_gt:
-                    assert(False)
-                    pts_vis = pts_sparse
-                    pool = ME.MinkowskiAvgPooling(kernel_size=2, stride=2, dimension=3)
-                    for k in range(4):
-                        with open(f"{folder}/datavis/gt_data_{data_idx}_{k}.txt", "w") as f:
-                            for (_, x, y, z), (r, g, b) in zip(
-                                pts_vis.C.cpu().numpy(),
-                                (torch.clamp(pts_vis.F, -1, 1) * 127.5 + 127.5).cpu().numpy().astype(np.uint8),
-                            ):
-                                f.write('%.3lf %.3lf %.3lf %d %d %d\n' % (x, y, z, r, g, b))
-                        pts_vis = pool(pts_vis)
-                    # pred_field = pts_sparse.slice(pts_field)
-                    # pred_im = (torch.clamp(pred_field.F[:-1], -1, 1) * 127.5 + 127.5).cpu().numpy().astype(np.uint8)
-                    # Image.fromarray(pred_im.reshape((256, 512, 3))).save(f"{folder}/datavis/data_{data_idx}_gt.png")
+                    # pts_vis = pts_sparse
+                    # pool = ME.MinkowskiAvgPooling(kernel_size=2, stride=2, dimension=3)
+                    # for k in range(4):
+                    #     with open(f"{folder}/datavis/gt_data_{data_idx}_{k}.txt", "w") as f:
+                    #         for (_, x, y, z), (r, g, b) in zip(
+                    #             pts_vis.C.cpu().numpy(),
+                    #             (torch.clamp(pts_vis.F, -1, 1) * 127.5 + 127.5).cpu().numpy().astype(np.uint8),
+                    #         ):
+                    #             f.write('%.3lf %.3lf %.3lf %d %d %d\n' % (x, y, z, r, g, b))
+                    #     pts_vis = pool(pts_vis)
+                    spatial_weight_colored = plt.get_cmap("viridis")(
+                        torch.clamp(spatial_weight[..., 0], 0.0, 1.0).cpu().numpy()
+                    )
+                    spatial_weight_colored = torch.from_numpy(spatial_weight_colored).cuda()
+                    spatial_weight_colored = set_feature(pts_sparse, spatial_weight_colored)
+                    with open(f"{folder}/datavis/data_weight_{data_idx}.txt", "w") as f:
+                        for (_, x, y, z), (r, g, b, _) in zip(
+                            spatial_weight_colored.C.cpu().numpy(),
+                            (spatial_weight_colored.F * 255.0).cpu().numpy().astype(np.uint8),
+                        ):
+                            f.write('%.3lf %.3lf %.3lf %d %d %d\n' % (x, y, z, r, g, b))
+                    with open(f"{folder}/datavis/data_{data_idx}.txt", "w") as f:
+                        for (_, x, y, z), (r, g, b) in zip(
+                            pts_sparse.C.cpu().numpy(),
+                            (torch.clamp(pts_sparse.F, -1, 1) * 127.5 + 127.5).cpu().numpy().astype(np.uint8),
+                        ):
+                            f.write('%.3lf %.3lf %.3lf %d %d %d\n' % (x, y, z, r, g, b))
+                    data_idx += 1
+                    continue
 
                 if not is_train:
                     accum = RasterizePointsXYsBlending()
@@ -1041,18 +1225,40 @@ if __name__ == "__main__":
                             if opt.use_ema:
                                 ema_model.load_state_dict(model_dict["ema_model"])
                             
-                            gt_field = pts_sparse.slice(pts_field)
+                            if opt.field_network:
+                                gt_field = pts_sparse
+                            else:
+                                gt_field = pts_sparse.slice(pts_field)
+
                             gt_im = accum(gt_field)
                             gt_im = (torch.clamp(gt_im, -1, 1) * 127.5 + 127.5).cpu().numpy().astype(np.uint8)[0].transpose([1, 2, 0])
                             Image.fromarray(gt_im).save(f"{folder}/datavis/data_ep{ckpt}_{data_idx}_gt.png")
-                            for sp_time in range(1):
-                                pred = ema_model.ema_model.sample(pts_sparse)
-                                pred_field = pred.slice(pts_field)
+
+                            with open(f"{folder}/datavis/data_ep{ckpt}_{data_idx}_gt.txt", "w") as f:
+                                for (_, x, y, z), (r, g, b) in zip(
+                                    pts_field.C.cpu().numpy() / float(scale),
+                                    (torch.clamp(pts_field.F[:, :3], -1, 1) * 127.5 + 127.5).cpu().numpy().astype(np.uint8),
+                                ):
+                                    f.write('%.3lf %.3lf %.3lf %d %d %d\n' % (x, y, z, r, g, b))
+
+                            for sp_time in range(opt.num_sample):
+                                pts_sparse = set_feature(pts_sparse, pts_sparse.F, same_manager=False)
+                                pred = ema_model.ema_model.sample(pts_sparse, mask_info)
+
+                                if mask_info is not None:
+                                    comb_ft = mask_info * pred.F + (1 - mask_info) * pts_sparse.F
+                                    pred = set_feature(pred, comb_ft)
+                
+                                if opt.field_network:
+                                    pred_field = pred
+                                else:
+                                    pred_field = pred.slice(pts_field)
+                                
                                 pred_im = accum(pred_field)
                                 with open(f"{folder}/datavis/data_ep{ckpt}_{data_idx}_sp{sp_time}.txt", "w") as f:
                                     for (_, x, y, z), (r, g, b) in zip(
-                                        pred.C.cpu().numpy(),
-                                        (torch.clamp(pred.F, -1, 1) * 127.5 + 127.5).cpu().numpy().astype(np.uint8),
+                                        pred_field.C.cpu().numpy() / float(scale),
+                                        (torch.clamp(pred_field.F, -1, 1) * 127.5 + 127.5).cpu().numpy().astype(np.uint8),
                                     ):
                                         f.write('%.3lf %.3lf %.3lf %d %d %d\n' % (x, y, z, r, g, b))
                                 # pad_batch = lambda ppp: torch.cat([ppp[:, :1] * 0, ppp], dim=-1)
@@ -1067,11 +1273,13 @@ if __name__ == "__main__":
                                 # pred_field = pred.features_at_coordinates(pad_batch(torch.from_numpy(holicity_pc_dataset.org_coord).to(device).float() * scale))
                                 pred_im = (torch.clamp(pred_im, -1, 1) * 127.5 + 127.5).cpu().numpy().astype(np.uint8)[0].transpose([1, 2, 0])
                                 Image.fromarray(pred_im).save(f"{folder}/datavis/data_ep{ckpt}_{data_idx}_sp{sp_time}.png")
+
+                                
                     data_idx += 1
                     continue
 
                 optimizer.zero_grad(set_to_none=True)
-                loss = diffusion_model(pts_sparse, spatial_weight=spatial_weight)
+                loss = diffusion_model(pts_sparse, spatial_weight=spatial_weight, mask_info=mask_info)
                 print(epoch, loss.item())
                 f.write(f"{epoch}\t{loss}\n")
                 f.flush()
@@ -1082,7 +1290,7 @@ if __name__ == "__main__":
             if is_train:
                 scheduler.step()
 
-            if epoch % 5 == 0:
+            if epoch % opt.save_every_epoch == 0:
                 state_dict = {
                     "epoch": epoch,
                     "model": diffusion_model.state_dict(),

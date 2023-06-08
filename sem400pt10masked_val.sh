@@ -1,0 +1,11 @@
+CUDA_VISIBLE_DEVICES=0 python3 denoising_diffusion_pytorch/denoising_diffusion_minkowski_resample_sem.py \
+    --dataset_folder "/cluster/project/cvg/zuoyue/holicity_point_cloud/4096x2048_resample_400_index_0_220/val" \
+    --net_attention "N N N N N N N N N N" \
+    --dataset_mode val \
+    --work_folder resample200augema_highres_sem400pt10masked \
+    --sampling_steps 1000 \
+    --use_ema \
+    --point_scale 10 \
+    --random_z_rotate \
+    --masked_generation 0.33 \
+    --ckpt "(240,241,1)"
